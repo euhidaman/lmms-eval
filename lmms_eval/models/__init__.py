@@ -23,6 +23,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "cogvlm2": "CogVLM2",
     "cambrians": "CambrianS",
     "egogpt": "EgoGPT",
+    "embervlm": "EmberVLM",
     "from_log": "FromLog",
     "fuyu": "Fuyu",
     "gemini_api": "GeminiAPI",

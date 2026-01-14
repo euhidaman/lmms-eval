@@ -439,3 +439,202 @@ class TinyLlava(lmms):
 
     def generate_until_multi_round(self, requests) -> List[str]:
         raise NotImplementedError("TODO: Implement multi-round generation")
+
+
+@register_model("embervlm")
+class EmberVLM(lmms):
+    """
+    EmberVLM Model - Tiny VLM for Robot Fleet Selection
+    """
+
+    def __init__(
+        self,
+        pretrained: str = "outputs/mobilevit_xs_smollm_135m/final",
+        device: str = "cuda",
+        batch_size: int = 1,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        
+        # Get checkpoint path from environment or parameter
+        import os
+        from pathlib import Path
+        checkpoint_path = os.environ.get('EMBERVLM_CHECKPOINT', pretrained)
+        checkpoint_path = Path(checkpoint_path)
+        
+        eval_logger.info(f"Loading EmberVLM from {checkpoint_path}")
+        
+        # Load EmberVLM model
+        try:
+            from embervlm.models import EmberVLM as EmberVLMModel, EmberVLMConfig
+            import torch
+            
+            # Load config and model
+            config = EmberVLMConfig.from_pretrained(str(checkpoint_path))
+            self.model = EmberVLMModel(config)
+            
+            # Load checkpoint
+            checkpoint_file = checkpoint_path / 'pytorch_model.bin'
+            if not checkpoint_file.exists():
+                checkpoint_file = checkpoint_path / 'model.safetensors'
+            
+            if checkpoint_file.exists():
+                if checkpoint_file.suffix == '.bin':
+                    checkpoint = torch.load(checkpoint_file, map_location='cpu')
+                    if 'model_state_dict' in checkpoint:
+                        self.model.load_state_dict(checkpoint['model_state_dict'])
+                    else:
+                        self.model.load_state_dict(checkpoint)
+                else:
+                    from safetensors.torch import load_file
+                    state_dict = load_file(checkpoint_file)
+                    self.model.load_state_dict(state_dict)
+                
+                eval_logger.info(f"✓ Loaded checkpoint from {checkpoint_file}")
+            else:
+                eval_logger.warning(f"No checkpoint found at {checkpoint_path}, using initialized weights")
+            
+            self.model = self.model.to(device).eval()
+            self._device = device
+            self._config = config
+            self._tokenizer = config.language_model.tokenizer if hasattr(config.language_model, 'tokenizer') else None
+            
+            eval_logger.info(f"✓ EmberVLM loaded successfully on {device}")
+            
+        except Exception as e:
+            eval_logger.error(f"Failed to load EmberVLM: {e}")
+            raise
+        
+        self.batch_size_per_gpu = batch_size
+
+    @property
+    def config(self):
+        return self._config
+
+    @property
+    def tokenizer(self):
+        return self._tokenizer
+
+    @property
+    def model_instance(self):
+        return self.model
+
+    @property
+    def eot_token_id(self):
+        if self.tokenizer:
+            return self.tokenizer.eos_token_id
+        return None
+
+    @property
+    def max_length(self):
+        return 2048
+
+    @property
+    def batch_size(self):
+        return self.batch_size_per_gpu
+
+    @property
+    def device(self):
+        return self._device
+
+    def tok_encode(self, string: str, **kwargs):
+        if self.tokenizer:
+            return self.tokenizer.encode(string, add_special_tokens=False)
+        return []
+
+    def tok_decode(self, tokens, **kwargs):
+        if self.tokenizer:
+            return self.tokenizer.decode(tokens)
+        return ""
+
+    def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
+        raise NotImplementedError("EmberVLM does not support loglikelihood evaluation")
+
+    def generate_until(self, requests: List[Instance]) -> List[str]:
+        """
+        Generate responses for EmberVLM evaluation.
+        
+        Args:
+            requests: List of Instance objects containing:
+                - doc: Dictionary with 'image' and 'question' fields
+                - arguments: Generation parameters
+        
+        Returns:
+            List of generated text responses
+        """
+        from PIL import Image
+        import torch
+        
+        results = []
+        
+        for request in tqdm(requests, desc="EmberVLM inference"):
+            doc = request.doc
+            
+            # Extract image and question
+            if isinstance(doc.get('image'), str):
+                image = Image.open(doc['image']).convert('RGB')
+            elif isinstance(doc.get('image'), Image.Image):
+                image = doc['image']
+            else:
+                eval_logger.warning(f"Invalid image type: {type(doc.get('image'))}")
+                results.append("")
+                continue
+            
+            question = doc.get('question', doc.get('text', ''))
+            
+            # Prepare inputs
+            try:
+                # Preprocess image
+                from torchvision import transforms
+                preprocess = transforms.Compose([
+                    transforms.Resize((224, 224)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                ])
+                image_tensor = preprocess(image).unsqueeze(0).to(self.device)
+                
+                # Tokenize question
+                if self.tokenizer:
+                    inputs = self.tokenizer(question, return_tensors='pt', padding=True)
+                    input_ids = inputs['input_ids'].to(self.device)
+                else:
+                    # Fallback if no tokenizer
+                    input_ids = None
+                
+                # Generate response
+                with torch.no_grad():
+                    if hasattr(self.model, 'generate'):
+                        output = self.model.generate(
+                            image=image_tensor,
+                            prompt=question,
+                            max_length=request.arguments.get('max_new_tokens', 512)
+                        )
+                    else:
+                        # Fallback for basic inference
+                        output = self.model(image_tensor, input_ids)
+                        if self.tokenizer and hasattr(output, 'logits'):
+                            output_ids = output.logits.argmax(dim=-1)
+                            output = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                        else:
+                            output = ""
+                
+                # Extract text from output
+                if isinstance(output, str):
+                    text = output
+                elif isinstance(output, dict) and 'text' in output:
+                    text = output['text']
+                elif isinstance(output, torch.Tensor):
+                    text = self.tokenizer.decode(output[0], skip_special_tokens=True) if self.tokenizer else ""
+                else:
+                    text = str(output)
+                
+                results.append(text)
+                
+            except Exception as e:
+                eval_logger.error(f"Error in EmberVLM generation: {e}")
+                results.append("")
+        
+        return results
+
+    def generate_until_multi_round(self, requests) -> List[str]:
+        raise NotImplementedError("EmberVLM does not support multi-round generation")
