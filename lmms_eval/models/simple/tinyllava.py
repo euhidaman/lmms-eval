@@ -771,12 +771,26 @@ class EmberVLM(lmms):
 
                 if self.tokenizer:
                     # Avoid padding for multimodal generation to prevent invalid pad token usage
+                    # Also cap text length to leave room for visual tokens within model position limits
+                    model_max_positions = None
+                    if self.model is not None and hasattr(self.model, 'language_model'):
+                        lm_config = getattr(self.model.language_model, 'config', None)
+                        if lm_config is not None:
+                            model_max_positions = getattr(lm_config, 'max_position_embeddings', None)
+                            if model_max_positions is None:
+                                model_max_positions = getattr(lm_config, 'n_positions', None)
+
+                    num_visual_tokens = getattr(getattr(self.model, 'config', None), 'num_visual_tokens', 0) or 0
+                    max_text_len = 1024
+                    if model_max_positions is not None:
+                        max_text_len = max(1, min(max_text_len, model_max_positions - num_visual_tokens))
+
                     inputs = self.tokenizer(
                         prompt,
                         return_tensors='pt',
                         padding=False,
                         truncation=True,
-                        max_length=1024,
+                        max_length=max_text_len,
                     )
                     input_ids = inputs['input_ids'].to(self.device)
                     # Clamp/replace token IDs to model vocab size to avoid CUDA index errors
