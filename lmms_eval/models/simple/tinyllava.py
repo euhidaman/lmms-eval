@@ -491,23 +491,8 @@ class EmberVLM(lmms):
             if self._tokenizer.pad_token is None:
                 self._tokenizer.pad_token = self._tokenizer.eos_token
 
-            # Ensure special tokens exist
-            special_tokens = ['<|reasoning_start|>', '<|reasoning_end|>', '<|robot_selection|>', '<|action_plan|>', '<|image|>']
-            existing = self._tokenizer.additional_special_tokens or []
-            new_tokens = [t for t in special_tokens if t not in existing]
-            if new_tokens:
-                self._tokenizer.add_special_tokens({'additional_special_tokens': existing + new_tokens})
-
-            # Ensure model embeddings match tokenizer size to avoid CUDA index errors
-            try:
-                if hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'resize_token_embeddings'):
-                    self.model.language_model.resize_token_embeddings(len(self._tokenizer))
-                elif hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model'):
-                    lm_model = self.model.language_model.model
-                    if hasattr(lm_model, 'resize_token_embeddings'):
-                        lm_model.resize_token_embeddings(len(self._tokenizer))
-            except Exception as e:
-                eval_logger.warning(f"Failed to resize token embeddings: {e}")
+            # Keep tokenizer vocab stable for evaluation (avoid adding new tokens here)
+            # This prevents token ids from exceeding the model's embedding size.
 
             self.model = self.model.to(device).eval()
             self._device = torch.device(device)
@@ -633,21 +618,25 @@ class EmberVLM(lmms):
                         max_length=1024,
                     )
                     input_ids = inputs['input_ids'].to(self.device)
-                    # Clamp token IDs to model vocab size to avoid CUDA index errors
+                    # Clamp/replace token IDs to model vocab size to avoid CUDA index errors
                     try:
+                        vocab_size = None
                         if hasattr(self.model, 'language_model'):
                             if hasattr(self.model.language_model, 'get_input_embeddings'):
                                 vocab_size = self.model.language_model.get_input_embeddings().weight.shape[0]
                             elif hasattr(self.model.language_model, 'model') and hasattr(self.model.language_model.model, 'get_input_embeddings'):
                                 vocab_size = self.model.language_model.model.get_input_embeddings().weight.shape[0]
-                            else:
-                                vocab_size = None
-                        else:
-                            vocab_size = None
+                        if vocab_size is None and self.tokenizer is not None:
+                            vocab_size = len(self.tokenizer)
+
                         if vocab_size is not None:
-                            input_ids = torch.clamp(input_ids, min=0, max=vocab_size - 1)
+                            input_ids = input_ids.clone()
+                            oov_mask = (input_ids >= vocab_size) | (input_ids < 0)
+                            if oov_mask.any():
+                                replacement_id = self.tokenizer.eos_token_id if self.tokenizer else 0
+                                input_ids[oov_mask] = replacement_id
                     except Exception as e:
-                        eval_logger.warning(f"Failed to clamp input_ids: {e}")
+                        eval_logger.warning(f"Failed to sanitize input_ids: {e}")
                     attention_mask = inputs.get('attention_mask', None)
                     if attention_mask is not None:
                         attention_mask = attention_mask.to(self.device)
