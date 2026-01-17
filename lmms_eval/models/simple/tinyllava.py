@@ -770,10 +770,11 @@ class EmberVLM(lmms):
                 prompt = prompt.replace("<|image|>", "").replace("<image>", "").strip()
 
                 if self.tokenizer:
+                    # Avoid padding for multimodal generation to prevent invalid pad token usage
                     inputs = self.tokenizer(
                         prompt,
                         return_tensors='pt',
-                        padding=True,
+                        padding=False,
                         truncation=True,
                         max_length=1024,
                     )
@@ -787,9 +788,7 @@ class EmberVLM(lmms):
                             replacement_id = min(self.tokenizer.eos_token_id or 0, vocab_size - 1)
                             eval_logger.debug(f"Replacing {oov_mask.sum().item()} OOV tokens with {replacement_id}")
                             input_ids[oov_mask] = replacement_id
-                    attention_mask = inputs.get('attention_mask', None)
-                    if attention_mask is not None:
-                        attention_mask = attention_mask.to(self.device)
+                    attention_mask = None
                 else:
                     input_ids = None
                     attention_mask = None
