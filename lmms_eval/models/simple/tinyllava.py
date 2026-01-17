@@ -721,6 +721,16 @@ class EmberVLM(lmms):
             return self.tokenizer.decode(tokens)
         return ""
 
+    def clean(self):
+        """Override clean method with safer CUDA cleanup."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except Exception as e:
+            eval_logger.warning(f"CUDA cleanup warning (non-critical): {e}")
+
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         raise NotImplementedError("EmberVLM does not support loglikelihood evaluation")
 
@@ -796,25 +806,37 @@ class EmberVLM(lmms):
 
                 self._ensure_generation_token_ids()
                 with torch.no_grad():
-                    outputs = self.model.generate(
-                        input_ids=input_ids,
-                        pixel_values=pixel_values,
-                        attention_mask=attention_mask,
-                        image_positions=image_positions,
-                        max_new_tokens=max_new_tokens,
-                        temperature=temperature,
-                        top_k=top_k,
-                        top_p=top_p,
-                        do_sample=do_sample,
-                    )
+                    try:
+                        outputs = self.model.generate(
+                            input_ids=input_ids,
+                            pixel_values=pixel_values,
+                            attention_mask=attention_mask,
+                            image_positions=image_positions,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            do_sample=do_sample,
+                        )
 
-                if isinstance(outputs, torch.Tensor) and self.tokenizer is not None:
-                    prompt_len = input_ids.size(1) if input_ids is not None else 0
-                    decoded = self.tokenizer.decode(outputs[0][prompt_len:], skip_special_tokens=True)
-                else:
-                    decoded = str(outputs)
+                        if isinstance(outputs, torch.Tensor) and self.tokenizer is not None:
+                            prompt_len = input_ids.size(1) if input_ids is not None else 0
+                            decoded = self.tokenizer.decode(outputs[0][prompt_len:], skip_special_tokens=True)
+                        else:
+                            decoded = str(outputs)
 
-                results.append(decoded.strip())
+                        results.append(decoded.strip())
+                    except RuntimeError as e:
+                        if 'CUDA' in str(e) or 'assert' in str(e).lower():
+                            eval_logger.error(f"CUDA error in generation (skipping): {e}")
+                            results.append("")
+                            # Clear CUDA error state
+                            try:
+                                torch.cuda.synchronize()
+                            except:
+                                pass
+                        else:
+                            raise
             except Exception as e:
                 eval_logger.error(f"Error in EmberVLM generation: {e}")
                 results.append("")
