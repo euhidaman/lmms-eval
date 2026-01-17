@@ -491,22 +491,6 @@ class EmberVLM(lmms):
             if self._tokenizer.pad_token is None:
                 self._tokenizer.pad_token = self._tokenizer.eos_token
 
-            # Ensure eos/pad token ids are within model vocab size
-            try:
-                vocab_size = None
-                if hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'get_input_embeddings'):
-                    vocab_size = self.model.language_model.get_input_embeddings().weight.shape[0]
-                elif hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model') and hasattr(self.model.language_model.model, 'get_input_embeddings'):
-                    vocab_size = self.model.language_model.model.get_input_embeddings().weight.shape[0]
-                if vocab_size is not None:
-                    safe_id = vocab_size - 1
-                    if self._tokenizer.eos_token_id is None or self._tokenizer.eos_token_id >= vocab_size:
-                        self._tokenizer.eos_token_id = safe_id
-                    if self._tokenizer.pad_token_id is None or self._tokenizer.pad_token_id >= vocab_size:
-                        self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
-            except Exception as e:
-                eval_logger.warning(f"Failed to validate tokenizer special ids: {e}")
-
             # Keep tokenizer vocab stable for evaluation (avoid adding new tokens here)
             # This prevents token ids from exceeding the model's embedding size.
 
@@ -514,6 +498,12 @@ class EmberVLM(lmms):
             self._device = torch.device(device)
             self._config = getattr(self.model, 'config', None)
             self.image_preprocessor = getattr(self.model, 'image_preprocessor', None)
+
+            # Get the actual embedding vocab size and fix all token IDs
+            self._actual_vocab_size = self._get_embedding_vocab_size()
+            if self._actual_vocab_size is not None:
+                self._fix_all_token_ids(self._actual_vocab_size)
+                eval_logger.info(f"✓ Tokenizer/model token IDs validated against vocab_size={self._actual_vocab_size}")
 
             eval_logger.info(f"✓ EmberVLM loaded successfully on {device}")
 
@@ -550,6 +540,86 @@ class EmberVLM(lmms):
     @property
     def device(self):
         return self._device
+
+    def _get_embedding_vocab_size(self) -> Optional[int]:
+        """Get the actual vocab size from model embeddings."""
+        try:
+            # Try multiple paths to find the embedding layer
+            if hasattr(self.model, 'language_model'):
+                lm = self.model.language_model
+                # SmolLMBackbone or PretrainedTinyLLMBackbone wrap the actual HF model in .model
+                if hasattr(lm, 'model'):
+                    inner_model = lm.model
+                    if hasattr(inner_model, 'get_input_embeddings'):
+                        emb = inner_model.get_input_embeddings()
+                        if emb is not None:
+                            return emb.weight.shape[0]
+                # Direct access
+                if hasattr(lm, 'get_input_embeddings'):
+                    emb = lm.get_input_embeddings()
+                    if emb is not None:
+                        return emb.weight.shape[0]
+            # Fallback: check model directly
+            if hasattr(self.model, 'get_input_embeddings'):
+                emb = self.model.get_input_embeddings()
+                if emb is not None:
+                    return emb.weight.shape[0]
+        except Exception as e:
+            eval_logger.warning(f"Could not determine embedding vocab size: {e}")
+        return None
+
+    def _fix_all_token_ids(self, vocab_size: int):
+        """Fix all token IDs in tokenizer and model configs to be within vocab_size."""
+        safe_eos_id = min(vocab_size - 1, 0) if vocab_size > 0 else 0
+
+        # 1. Fix tokenizer special token IDs
+        if self._tokenizer is not None:
+            if self._tokenizer.eos_token_id is None or self._tokenizer.eos_token_id >= vocab_size:
+                eval_logger.warning(f"Fixing tokenizer eos_token_id from {self._tokenizer.eos_token_id} to {safe_eos_id}")
+                self._tokenizer.eos_token_id = safe_eos_id
+            if self._tokenizer.pad_token_id is None or self._tokenizer.pad_token_id >= vocab_size:
+                eval_logger.warning(f"Fixing tokenizer pad_token_id from {self._tokenizer.pad_token_id} to {self._tokenizer.eos_token_id}")
+                self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
+
+        # 2. Fix the underlying HuggingFace model config (used by generate())
+        try:
+            if hasattr(self.model, 'language_model'):
+                lm = self.model.language_model
+                # Fix the wrapper's config
+                if hasattr(lm, 'config'):
+                    if hasattr(lm.config, 'eos_token_id') and (lm.config.eos_token_id is None or lm.config.eos_token_id >= vocab_size):
+                        lm.config.eos_token_id = safe_eos_id
+                    if hasattr(lm.config, 'pad_token_id') and (lm.config.pad_token_id is None or lm.config.pad_token_id >= vocab_size):
+                        lm.config.pad_token_id = safe_eos_id
+                    if hasattr(lm.config, 'bos_token_id') and lm.config.bos_token_id is not None and lm.config.bos_token_id >= vocab_size:
+                        lm.config.bos_token_id = safe_eos_id
+
+                # Fix the inner HF model's config (this is what generate() actually uses!)
+                if hasattr(lm, 'model') and hasattr(lm.model, 'config'):
+                    inner_config = lm.model.config
+                    if hasattr(inner_config, 'eos_token_id') and (inner_config.eos_token_id is None or inner_config.eos_token_id >= vocab_size):
+                        eval_logger.warning(f"Fixing inner model eos_token_id from {inner_config.eos_token_id} to {safe_eos_id}")
+                        inner_config.eos_token_id = safe_eos_id
+                    if hasattr(inner_config, 'pad_token_id') and (inner_config.pad_token_id is None or inner_config.pad_token_id >= vocab_size):
+                        eval_logger.warning(f"Fixing inner model pad_token_id from {inner_config.pad_token_id} to {safe_eos_id}")
+                        inner_config.pad_token_id = safe_eos_id
+                    if hasattr(inner_config, 'bos_token_id') and inner_config.bos_token_id is not None and inner_config.bos_token_id >= vocab_size:
+                        inner_config.bos_token_id = safe_eos_id
+
+                # Also fix generation_config if it exists
+                if hasattr(lm, 'model') and hasattr(lm.model, 'generation_config'):
+                    gen_config = lm.model.generation_config
+                    if hasattr(gen_config, 'eos_token_id') and gen_config.eos_token_id is not None:
+                        if isinstance(gen_config.eos_token_id, int) and gen_config.eos_token_id >= vocab_size:
+                            gen_config.eos_token_id = safe_eos_id
+                        elif isinstance(gen_config.eos_token_id, list):
+                            gen_config.eos_token_id = [min(x, vocab_size - 1) for x in gen_config.eos_token_id]
+                    if hasattr(gen_config, 'pad_token_id') and gen_config.pad_token_id is not None and gen_config.pad_token_id >= vocab_size:
+                        gen_config.pad_token_id = safe_eos_id
+                    if hasattr(gen_config, 'bos_token_id') and gen_config.bos_token_id is not None and gen_config.bos_token_id >= vocab_size:
+                        gen_config.bos_token_id = safe_eos_id
+        except Exception as e:
+            eval_logger.warning(f"Failed to fix model config token IDs: {e}")
 
     def flatten(self, input):
         if not input:
@@ -635,27 +705,14 @@ class EmberVLM(lmms):
                     )
                     input_ids = inputs['input_ids'].to(self.device)
                     # Clamp/replace token IDs to model vocab size to avoid CUDA index errors
-                    try:
-                        vocab_size = None
-                        if hasattr(self.model, 'language_model'):
-                            if hasattr(self.model.language_model, 'get_input_embeddings'):
-                                vocab_size = self.model.language_model.get_input_embeddings().weight.shape[0]
-                            elif hasattr(self.model.language_model, 'model') and hasattr(self.model.language_model.model, 'get_input_embeddings'):
-                                vocab_size = self.model.language_model.model.get_input_embeddings().weight.shape[0]
-                        if vocab_size is None and self.tokenizer is not None:
-                            vocab_size = len(self.tokenizer)
-
-                        if vocab_size is not None:
-                            input_ids = input_ids.clone()
-                            oov_mask = (input_ids >= vocab_size) | (input_ids < 0)
-                            if oov_mask.any():
-                                if self.tokenizer is not None and self.tokenizer.eos_token_id is not None:
-                                    replacement_id = min(self.tokenizer.eos_token_id, vocab_size - 1)
-                                else:
-                                    replacement_id = vocab_size - 1
-                                input_ids[oov_mask] = replacement_id
-                    except Exception as e:
-                        eval_logger.warning(f"Failed to sanitize input_ids: {e}")
+                    vocab_size = getattr(self, '_actual_vocab_size', None)
+                    if vocab_size is not None:
+                        input_ids = input_ids.clone()
+                        oov_mask = (input_ids >= vocab_size) | (input_ids < 0)
+                        if oov_mask.any():
+                            replacement_id = min(self.tokenizer.eos_token_id or 0, vocab_size - 1)
+                            eval_logger.debug(f"Replacing {oov_mask.sum().item()} OOV tokens with {replacement_id}")
+                            input_ids[oov_mask] = replacement_id
                     attention_mask = inputs.get('attention_mask', None)
                     if attention_mask is not None:
                         attention_mask = attention_mask.to(self.device)
