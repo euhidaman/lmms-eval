@@ -633,6 +633,21 @@ class EmberVLM(lmms):
                         max_length=1024,
                     )
                     input_ids = inputs['input_ids'].to(self.device)
+                    # Clamp token IDs to model vocab size to avoid CUDA index errors
+                    try:
+                        if hasattr(self.model, 'language_model'):
+                            if hasattr(self.model.language_model, 'get_input_embeddings'):
+                                vocab_size = self.model.language_model.get_input_embeddings().weight.shape[0]
+                            elif hasattr(self.model.language_model, 'model') and hasattr(self.model.language_model.model, 'get_input_embeddings'):
+                                vocab_size = self.model.language_model.model.get_input_embeddings().weight.shape[0]
+                            else:
+                                vocab_size = None
+                        else:
+                            vocab_size = None
+                        if vocab_size is not None:
+                            input_ids = torch.clamp(input_ids, min=0, max=vocab_size - 1)
+                    except Exception as e:
+                        eval_logger.warning(f"Failed to clamp input_ids: {e}")
                     attention_mask = inputs.get('attention_mask', None)
                     if attention_mask is not None:
                         attention_mask = attention_mask.to(self.device)
