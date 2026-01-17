@@ -794,7 +794,7 @@ class EmberVLM(lmms):
                 if pixel_values is not None and input_ids is not None:
                     image_positions = torch.zeros(input_ids.size(0), dtype=torch.long, device=self.device)
 
-                pad_id, eos_id, _ = self._ensure_generation_token_ids()
+                self._ensure_generation_token_ids()
                 with torch.no_grad():
                     outputs = self.model.generate(
                         input_ids=input_ids,
@@ -806,8 +806,6 @@ class EmberVLM(lmms):
                         top_k=top_k,
                         top_p=top_p,
                         do_sample=do_sample,
-                        pad_token_id=pad_id,
-                        eos_token_id=eos_id,
                     )
 
                 if isinstance(outputs, torch.Tensor) and self.tokenizer is not None:
