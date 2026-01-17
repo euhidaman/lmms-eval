@@ -476,6 +476,19 @@ class EmberVLM(lmms):
             # Load model from checkpoint directory
             self.model = EmberVLMModel.from_pretrained(str(checkpoint_path))
 
+            # Move to device first to enable embedding inspection
+            self.model = self.model.to(device).eval()
+            self._device = torch.device(device)
+            self._config = getattr(self.model, 'config', None)
+            self.image_preprocessor = getattr(self.model, 'image_preprocessor', None)
+
+            # Get the actual embedding vocab size from the loaded model FIRST
+            self._actual_vocab_size = self._get_embedding_vocab_size()
+            if self._actual_vocab_size is None:
+                raise RuntimeError("❌ Could not determine model embedding size! Cannot safely run evaluation.")
+
+            eval_logger.info(f"📊 Model embedding matrix size: {self._actual_vocab_size}")
+
             # Resolve tokenizer path: prefer sibling 'tokenizer' directory
             tokenizer_path = checkpoint_path / 'tokenizer'
             if not tokenizer_path.exists():
@@ -485,27 +498,71 @@ class EmberVLM(lmms):
 
             if tokenizer_path.exists():
                 self._tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
+                eval_logger.info(f"✓ Loaded tokenizer from {tokenizer_path}")
             else:
                 self._tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M")
+                eval_logger.warning(f"⚠️  Tokenizer not found at {tokenizer_path}, using default SmolLM-135M")
 
+            tokenizer_vocab_size = len(self._tokenizer)
+            eval_logger.info(f"📊 Tokenizer vocabulary size: {tokenizer_vocab_size}")
+
+            # CRITICAL FIX: Resize embeddings if there's a mismatch
+            if tokenizer_vocab_size != self._actual_vocab_size:
+                eval_logger.warning(
+                    f"⚠️  MISMATCH: Tokenizer({tokenizer_vocab_size}) ≠ Model({self._actual_vocab_size})"
+                )
+
+                if tokenizer_vocab_size > self._actual_vocab_size:
+                    eval_logger.warning(f"   → Resizing model embeddings from {self._actual_vocab_size} to {tokenizer_vocab_size}...")
+
+                    # Resize the embeddings
+                    try:
+                        if hasattr(self.model, 'language_model'):
+                            if hasattr(self.model.language_model, 'resize_token_embeddings'):
+                                self.model.language_model.resize_token_embeddings(tokenizer_vocab_size)
+                                eval_logger.info(f"   ✓ Resized via language_model.resize_token_embeddings")
+                            elif hasattr(self.model.language_model, 'model') and hasattr(self.model.language_model.model, 'resize_token_embeddings'):
+                                self.model.language_model.model.resize_token_embeddings(tokenizer_vocab_size)
+                                eval_logger.info(f"   ✓ Resized via language_model.model.resize_token_embeddings")
+                            else:
+                                raise RuntimeError("No resize_token_embeddings method found")
+
+                            # Update config vocab_size
+                            if hasattr(self.model.language_model, 'config'):
+                                self.model.language_model.config.vocab_size = tokenizer_vocab_size
+                            if hasattr(self.model.language_model, 'model') and hasattr(self.model.language_model.model, 'config'):
+                                self.model.language_model.model.config.vocab_size = tokenizer_vocab_size
+
+                            self._actual_vocab_size = tokenizer_vocab_size
+                            eval_logger.info(f"✓ Model embeddings resized to {self._actual_vocab_size}")
+                        else:
+                            raise RuntimeError("language_model not found in model")
+                    except Exception as e:
+                        eval_logger.error(f"❌ Failed to resize embeddings: {e}")
+                        raise
+                else:
+                    eval_logger.warning(f"   → Tokenizer is smaller - this is unusual but proceeding with caution")
+
+            # Ensure pad token is set
             if self._tokenizer.pad_token is None:
                 self._tokenizer.pad_token = self._tokenizer.eos_token
+                eval_logger.info(f"✓ Set pad_token = eos_token ({self._tokenizer.eos_token_id})")
 
-            # Keep tokenizer vocab stable for evaluation (avoid adding new tokens here)
-            # This prevents token ids from exceeding the model's embedding size.
+            # Fix all special token IDs to be within valid range
+            self._fix_all_token_ids(self._actual_vocab_size)
 
-            self.model = self.model.to(device).eval()
-            self._device = torch.device(device)
-            self._config = getattr(self.model, 'config', None)
-            self.image_preprocessor = getattr(self.model, 'image_preprocessor', None)
-
-            # Get the actual embedding vocab size and fix all token IDs
-            self._actual_vocab_size = self._get_embedding_vocab_size()
-            if self._actual_vocab_size is None and self._tokenizer is not None:
-                self._actual_vocab_size = len(self._tokenizer)
-            if self._actual_vocab_size is not None:
-                self._fix_all_token_ids(self._actual_vocab_size)
-                eval_logger.info(f"✓ Tokenizer/model token IDs validated against vocab_size={self._actual_vocab_size}")
+            # Final validation
+            final_vocab = self._get_embedding_vocab_size()
+            eval_logger.info(f"")
+            eval_logger.info(f"{'='*60}")
+            eval_logger.info(f"FINAL TOKENIZER/MODEL ALIGNMENT:")
+            eval_logger.info(f"  Model embedding size: {final_vocab}")
+            eval_logger.info(f"  Tokenizer vocab size: {len(self._tokenizer)}")
+            eval_logger.info(f"  EOS token ID: {self._tokenizer.eos_token_id}")
+            eval_logger.info(f"  PAD token ID: {self._tokenizer.pad_token_id}")
+            eval_logger.info(f"  Status: {'✓ ALIGNED' if final_vocab == len(self._tokenizer) else '❌ MISALIGNED'}")
+            eval_logger.info(f"{'='*60}")
+            eval_logger.info(f"")
 
             eval_logger.info(f"✓ EmberVLM loaded successfully on {device}")
 
@@ -816,6 +873,20 @@ class EmberVLM(lmms):
                 image_positions = None
                 if pixel_values is not None and input_ids is not None:
                     image_positions = torch.zeros(input_ids.size(0), dtype=torch.long, device=self.device)
+
+                # FINAL SAFETY CHECK: Validate input_ids are all within bounds
+                if input_ids is not None:
+                    vocab_size = self._actual_vocab_size
+                    max_id = input_ids.max().item()
+                    min_id = input_ids.min().item()
+                    if max_id >= vocab_size or min_id < 0:
+                        eval_logger.error(
+                            f"❌ CRITICAL: Token IDs still out of bounds before generation! "
+                            f"Range: [{min_id}, {max_id}], Valid: [0, {vocab_size-1}]"
+                        )
+                        # Emergency clamp on CPU
+                        input_ids = torch.clamp(input_ids.cpu(), 0, vocab_size - 1).to(self.device)
+                        eval_logger.warning(f"   → Emergency clamped to valid range")
 
                 self._ensure_generation_token_ids()
                 with torch.no_grad():
