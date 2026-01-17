@@ -551,12 +551,22 @@ def stderr_for_metric(metric, bootstrap_iters: int):
         return None
     # for coco_cap_chair
     # for amber_g
-    from lmms_eval.tasks.amber_g.utils import (
-        amber_g_aggregate_chair,
-        amber_g_aggregate_cog,
-        amber_g_aggregate_cover,
-        amber_g_aggregate_hal,
-    )
+    amber_g_aggregate_chair = None
+    amber_g_aggregate_cog = None
+    amber_g_aggregate_cover = None
+    amber_g_aggregate_hal = None
+    try:
+        from lmms_eval.tasks.amber_g.utils import (
+            amber_g_aggregate_chair,
+            amber_g_aggregate_cog,
+            amber_g_aggregate_cover,
+            amber_g_aggregate_hal,
+        )
+    except Exception as e:
+        eval_logger.warning(
+            "amber_g metrics unavailable (missing optional deps). "
+            f"Skipping amber_g stderr: {e}"
+        )
     from lmms_eval.tasks.coco_cap_chair.utils import (
         coco_cap_chair_aggregate_results_chair_i,
         coco_cap_chair_aggregate_results_chair_s,
@@ -579,6 +589,7 @@ def stderr_for_metric(metric, bootstrap_iters: int):
         amber_g_aggregate_hal,
         amber_g_aggregate_cog,
     ]
+    bootstrappable = [m for m in bootstrappable if m is not None]
 
     if metric in bootstrappable:
         return lambda x: bootstrap_stderr(metric, x, iters=bootstrap_iters)
