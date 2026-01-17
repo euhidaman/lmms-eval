@@ -498,6 +498,17 @@ class EmberVLM(lmms):
             if new_tokens:
                 self._tokenizer.add_special_tokens({'additional_special_tokens': existing + new_tokens})
 
+            # Ensure model embeddings match tokenizer size to avoid CUDA index errors
+            try:
+                if hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'resize_token_embeddings'):
+                    self.model.language_model.resize_token_embeddings(len(self._tokenizer))
+                elif hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model'):
+                    lm_model = self.model.language_model.model
+                    if hasattr(lm_model, 'resize_token_embeddings'):
+                        lm_model.resize_token_embeddings(len(self._tokenizer))
+            except Exception as e:
+                eval_logger.warning(f"Failed to resize token embeddings: {e}")
+
             self.model = self.model.to(device).eval()
             self._device = torch.device(device)
             self._config = getattr(self.model, 'config', None)
