@@ -501,6 +501,8 @@ class EmberVLM(lmms):
 
             # Get the actual embedding vocab size and fix all token IDs
             self._actual_vocab_size = self._get_embedding_vocab_size()
+            if self._actual_vocab_size is None and self._tokenizer is not None:
+                self._actual_vocab_size = len(self._tokenizer)
             if self._actual_vocab_size is not None:
                 self._fix_all_token_ids(self._actual_vocab_size)
                 eval_logger.info(f"✓ Tokenizer/model token IDs validated against vocab_size={self._actual_vocab_size}")
@@ -564,13 +566,16 @@ class EmberVLM(lmms):
                 emb = self.model.get_input_embeddings()
                 if emb is not None:
                     return emb.weight.shape[0]
+            # Fallback to config vocab size if embeddings aren't accessible
+            if hasattr(self.model, 'config') and getattr(self.model.config, 'vocab_size', None):
+                return int(self.model.config.vocab_size)
         except Exception as e:
             eval_logger.warning(f"Could not determine embedding vocab size: {e}")
         return None
 
     def _fix_all_token_ids(self, vocab_size: int):
         """Fix all token IDs in tokenizer and model configs to be within vocab_size."""
-        safe_eos_id = min(vocab_size - 1, 0) if vocab_size > 0 else 0
+        safe_eos_id = (vocab_size - 1) if vocab_size > 0 else 0
 
         # 1. Fix tokenizer special token IDs
         if self._tokenizer is not None:
@@ -620,6 +625,65 @@ class EmberVLM(lmms):
                         gen_config.bos_token_id = safe_eos_id
         except Exception as e:
             eval_logger.warning(f"Failed to fix model config token IDs: {e}")
+
+    def _ensure_generation_token_ids(self) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+        """Ensure pad/eos/bos token IDs are valid for generation and return them."""
+        vocab_size = self._get_embedding_vocab_size()
+        if vocab_size is None:
+            vocab_size = getattr(self, '_actual_vocab_size', None)
+        if vocab_size is None and self._tokenizer is not None:
+            vocab_size = len(self._tokenizer)
+
+        if vocab_size is None:
+            return None, None, None
+
+        safe_id = (vocab_size - 1) if vocab_size > 0 else 0
+
+        eos_id = self._tokenizer.eos_token_id if self._tokenizer and self._tokenizer.eos_token_id is not None else safe_id
+        if eos_id >= vocab_size:
+            eos_id = safe_id
+
+        pad_id = self._tokenizer.pad_token_id if self._tokenizer and self._tokenizer.pad_token_id is not None else eos_id
+        if pad_id >= vocab_size:
+            pad_id = eos_id
+
+        bos_id = None
+        if self._tokenizer and getattr(self._tokenizer, 'bos_token_id', None) is not None:
+            bos_id = self._tokenizer.bos_token_id
+            if bos_id >= vocab_size:
+                bos_id = safe_id
+
+        # Update tokenizer ids
+        if self._tokenizer is not None:
+            self._tokenizer.eos_token_id = eos_id
+            self._tokenizer.pad_token_id = pad_id
+            if bos_id is not None:
+                self._tokenizer.bos_token_id = bos_id
+
+        # Update model configs used by generate()
+        try:
+            if hasattr(self.model, 'language_model'):
+                lm = self.model.language_model
+                if hasattr(lm, 'config'):
+                    lm.config.eos_token_id = eos_id
+                    lm.config.pad_token_id = pad_id
+                    if bos_id is not None:
+                        lm.config.bos_token_id = bos_id
+                if hasattr(lm, 'model') and hasattr(lm.model, 'config'):
+                    lm.model.config.eos_token_id = eos_id
+                    lm.model.config.pad_token_id = pad_id
+                    if bos_id is not None:
+                        lm.model.config.bos_token_id = bos_id
+                if hasattr(lm, 'model') and hasattr(lm.model, 'generation_config'):
+                    gen_config = lm.model.generation_config
+                    gen_config.eos_token_id = eos_id
+                    gen_config.pad_token_id = pad_id
+                    if bos_id is not None:
+                        gen_config.bos_token_id = bos_id
+        except Exception as e:
+            eval_logger.warning(f"Failed to enforce generation token ids: {e}")
+
+        return pad_id, eos_id, bos_id
 
     def flatten(self, input):
         if not input:
@@ -730,6 +794,7 @@ class EmberVLM(lmms):
                 if pixel_values is not None and input_ids is not None:
                     image_positions = torch.zeros(input_ids.size(0), dtype=torch.long, device=self.device)
 
+                pad_id, eos_id, _ = self._ensure_generation_token_ids()
                 with torch.no_grad():
                     outputs = self.model.generate(
                         input_ids=input_ids,
@@ -741,6 +806,8 @@ class EmberVLM(lmms):
                         top_k=top_k,
                         top_p=top_p,
                         do_sample=do_sample,
+                        pad_token_id=pad_id,
+                        eos_token_id=eos_id,
                     )
 
                 if isinstance(outputs, torch.Tensor) and self.tokenizer is not None:
