@@ -452,60 +452,62 @@ class EmberVLM(lmms):
         pretrained: str = "outputs/mobilevit_xs_smollm_135m/final",
         device: str = "cuda",
         batch_size: int = 1,
+        max_length: int = 2048,
         **kwargs,
     ) -> None:
         super().__init__()
-        
+        self.batch_size_per_gpu = batch_size
+        self._max_length = max_length
+
         # Get checkpoint path from environment or parameter
         import os
         from pathlib import Path
+        import torch
         checkpoint_path = os.environ.get('EMBERVLM_CHECKPOINT', pretrained)
         checkpoint_path = Path(checkpoint_path)
-        
+
         eval_logger.info(f"Loading EmberVLM from {checkpoint_path}")
-        
+
         # Load EmberVLM model
         try:
-            from embervlm.models import EmberVLM as EmberVLMModel, EmberVLMConfig
-            import torch
-            
-            # Load config and model
-            config = EmberVLMConfig.from_pretrained(str(checkpoint_path))
-            self.model = EmberVLMModel(config)
-            
-            # Load checkpoint
-            checkpoint_file = checkpoint_path / 'pytorch_model.bin'
-            if not checkpoint_file.exists():
-                checkpoint_file = checkpoint_path / 'model.safetensors'
-            
-            if checkpoint_file.exists():
-                if checkpoint_file.suffix == '.bin':
-                    checkpoint = torch.load(checkpoint_file, map_location='cpu')
-                    if 'model_state_dict' in checkpoint:
-                        self.model.load_state_dict(checkpoint['model_state_dict'])
-                    else:
-                        self.model.load_state_dict(checkpoint)
-                else:
-                    from safetensors.torch import load_file
-                    state_dict = load_file(checkpoint_file)
-                    self.model.load_state_dict(state_dict)
-                
-                eval_logger.info(f"✓ Loaded checkpoint from {checkpoint_file}")
+            from embervlm.models import EmberVLM as EmberVLMModel
+            from transformers import AutoTokenizer
+
+            # Load model from checkpoint directory
+            self.model = EmberVLMModel.from_pretrained(str(checkpoint_path))
+
+            # Resolve tokenizer path: prefer sibling 'tokenizer' directory
+            tokenizer_path = checkpoint_path / 'tokenizer'
+            if not tokenizer_path.exists():
+                # checkpoint_path = .../stage2/checkpoint-epoch-X
+                # tokenizer lives at .../stage2/../tokenizer
+                tokenizer_path = checkpoint_path.parent.parent / 'tokenizer'
+
+            if tokenizer_path.exists():
+                self._tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
             else:
-                eval_logger.warning(f"No checkpoint found at {checkpoint_path}, using initialized weights")
-            
+                self._tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M")
+
+            if self._tokenizer.pad_token is None:
+                self._tokenizer.pad_token = self._tokenizer.eos_token
+
+            # Ensure special tokens exist
+            special_tokens = ['<|reasoning_start|>', '<|reasoning_end|>', '<|robot_selection|>', '<|action_plan|>', '<|image|>']
+            existing = self._tokenizer.additional_special_tokens or []
+            new_tokens = [t for t in special_tokens if t not in existing]
+            if new_tokens:
+                self._tokenizer.add_special_tokens({'additional_special_tokens': existing + new_tokens})
+
             self.model = self.model.to(device).eval()
-            self._device = device
-            self._config = config
-            self._tokenizer = config.language_model.tokenizer if hasattr(config.language_model, 'tokenizer') else None
-            
+            self._device = torch.device(device)
+            self._config = getattr(self.model, 'config', None)
+            self.image_preprocessor = getattr(self.model, 'image_preprocessor', None)
+
             eval_logger.info(f"✓ EmberVLM loaded successfully on {device}")
-            
+
         except Exception as e:
             eval_logger.error(f"Failed to load EmberVLM: {e}")
             raise
-        
-        self.batch_size_per_gpu = batch_size
 
     @property
     def config(self):
@@ -527,7 +529,7 @@ class EmberVLM(lmms):
 
     @property
     def max_length(self):
-        return 2048
+        return self._max_length
 
     @property
     def batch_size(self):
@@ -536,6 +538,32 @@ class EmberVLM(lmms):
     @property
     def device(self):
         return self._device
+
+    def flatten(self, input):
+        if not input:
+            return []
+        new_list = []
+        for i in input:
+            if isinstance(i, (list, tuple)):
+                new_list.extend(i)
+            else:
+                new_list.append(i)
+        return new_list
+
+    def _load_image(self, visual):
+        from PIL import Image
+        if isinstance(visual, Image.Image):
+            return visual.convert('RGB')
+        if isinstance(visual, str):
+            return Image.open(visual).convert('RGB')
+        return None
+
+    def _pil_to_tensor(self, image):
+        import numpy as np
+        import torch
+        image_np = np.array(image).astype('float32') / 255.0
+        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0)
+        return image_tensor
 
     def tok_encode(self, string: str, **kwargs):
         if self.tokenizer:
@@ -562,78 +590,79 @@ class EmberVLM(lmms):
         Returns:
             List of generated text responses
         """
-        from PIL import Image
         import torch
-        
+
         results = []
-        
         for request in tqdm(requests, desc="EmberVLM inference"):
-            doc = request.doc
-            
-            # Extract image and question
-            if isinstance(doc.get('image'), str):
-                image = Image.open(doc['image']).convert('RGB')
-            elif isinstance(doc.get('image'), Image.Image):
-                image = doc['image']
-            else:
-                eval_logger.warning(f"Invalid image type: {type(doc.get('image'))}")
-                results.append("")
-                continue
-            
-            question = doc.get('question', doc.get('text', ''))
-            
-            # Prepare inputs
             try:
-                # Preprocess image
-                from torchvision import transforms
-                preprocess = transforms.Compose([
-                    transforms.Resize((224, 224)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                ])
-                image_tensor = preprocess(image).unsqueeze(0).to(self.device)
-                
-                # Tokenize question
+                contexts, gen_kwargs, doc_to_visual, doc_id, task, split = request.arguments
+                gen_kwargs = gen_kwargs or {}
+
+                max_new_tokens = gen_kwargs.get("max_new_tokens", 128)
+                temperature = gen_kwargs.get("temperature", 0.0)
+                top_p = gen_kwargs.get("top_p", 0.9)
+                top_k = gen_kwargs.get("top_k", 50)
+                do_sample = gen_kwargs.get("do_sample", temperature > 0)
+
+                visuals = [doc_to_visual(self.task_dict[task][split][doc_id])]
+                visuals = self.flatten(visuals)
+                image = None
+                if visuals:
+                    image = self._load_image(visuals[0])
+
+                prompt = contexts or ""
+                prompt = prompt.replace("<|image|>", "").replace("<image>", "").strip()
+
                 if self.tokenizer:
-                    inputs = self.tokenizer(question, return_tensors='pt', padding=True)
+                    inputs = self.tokenizer(
+                        prompt,
+                        return_tensors='pt',
+                        padding=True,
+                        truncation=True,
+                        max_length=1024,
+                    )
                     input_ids = inputs['input_ids'].to(self.device)
+                    attention_mask = inputs.get('attention_mask', None)
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.to(self.device)
                 else:
-                    # Fallback if no tokenizer
                     input_ids = None
-                
-                # Generate response
+                    attention_mask = None
+
+                pixel_values = None
+                if image is not None and self.image_preprocessor is not None:
+                    image_tensor = self._pil_to_tensor(image).to(self.device, dtype=torch.float32)
+                    pixel_values = self.image_preprocessor(image_tensor)
+                    pixel_values = pixel_values.to(self.device)
+
+                image_positions = None
+                if pixel_values is not None and input_ids is not None:
+                    image_positions = torch.zeros(input_ids.size(0), dtype=torch.long, device=self.device)
+
                 with torch.no_grad():
-                    if hasattr(self.model, 'generate'):
-                        output = self.model.generate(
-                            image=image_tensor,
-                            prompt=question,
-                            max_length=request.arguments.get('max_new_tokens', 512)
-                        )
-                    else:
-                        # Fallback for basic inference
-                        output = self.model(image_tensor, input_ids)
-                        if self.tokenizer and hasattr(output, 'logits'):
-                            output_ids = output.logits.argmax(dim=-1)
-                            output = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-                        else:
-                            output = ""
-                
-                # Extract text from output
-                if isinstance(output, str):
-                    text = output
-                elif isinstance(output, dict) and 'text' in output:
-                    text = output['text']
-                elif isinstance(output, torch.Tensor):
-                    text = self.tokenizer.decode(output[0], skip_special_tokens=True) if self.tokenizer else ""
+                    outputs = self.model.generate(
+                        input_ids=input_ids,
+                        pixel_values=pixel_values,
+                        attention_mask=attention_mask,
+                        image_positions=image_positions,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        do_sample=do_sample,
+                    )
+
+                if isinstance(outputs, torch.Tensor) and self.tokenizer is not None:
+                    prompt_len = input_ids.size(1) if input_ids is not None else 0
+                    decoded = self.tokenizer.decode(outputs[0][prompt_len:], skip_special_tokens=True)
                 else:
-                    text = str(output)
-                
-                results.append(text)
-                
+                    decoded = str(outputs)
+
+                results.append(decoded.strip())
             except Exception as e:
                 eval_logger.error(f"Error in EmberVLM generation: {e}")
                 results.append("")
-        
+
         return results
 
     def generate_until_multi_round(self, requests) -> List[str]:
