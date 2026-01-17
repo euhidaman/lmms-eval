@@ -491,6 +491,22 @@ class EmberVLM(lmms):
             if self._tokenizer.pad_token is None:
                 self._tokenizer.pad_token = self._tokenizer.eos_token
 
+            # Ensure eos/pad token ids are within model vocab size
+            try:
+                vocab_size = None
+                if hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'get_input_embeddings'):
+                    vocab_size = self.model.language_model.get_input_embeddings().weight.shape[0]
+                elif hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model') and hasattr(self.model.language_model.model, 'get_input_embeddings'):
+                    vocab_size = self.model.language_model.model.get_input_embeddings().weight.shape[0]
+                if vocab_size is not None:
+                    safe_id = vocab_size - 1
+                    if self._tokenizer.eos_token_id is None or self._tokenizer.eos_token_id >= vocab_size:
+                        self._tokenizer.eos_token_id = safe_id
+                    if self._tokenizer.pad_token_id is None or self._tokenizer.pad_token_id >= vocab_size:
+                        self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
+            except Exception as e:
+                eval_logger.warning(f"Failed to validate tokenizer special ids: {e}")
+
             # Keep tokenizer vocab stable for evaluation (avoid adding new tokens here)
             # This prevents token ids from exceeding the model's embedding size.
 
@@ -633,7 +649,10 @@ class EmberVLM(lmms):
                             input_ids = input_ids.clone()
                             oov_mask = (input_ids >= vocab_size) | (input_ids < 0)
                             if oov_mask.any():
-                                replacement_id = self.tokenizer.eos_token_id if self.tokenizer else 0
+                                if self.tokenizer is not None and self.tokenizer.eos_token_id is not None:
+                                    replacement_id = min(self.tokenizer.eos_token_id, vocab_size - 1)
+                                else:
+                                    replacement_id = vocab_size - 1
                                 input_ids[oov_mask] = replacement_id
                     except Exception as e:
                         eval_logger.warning(f"Failed to sanitize input_ids: {e}")
