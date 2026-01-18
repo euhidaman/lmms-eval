@@ -461,8 +461,29 @@ class EmberVLM(lmms):
 
         # Get checkpoint path from environment or parameter
         import os
+        import sys
         from pathlib import Path
         import torch
+
+        # CRITICAL: Add EmberVLM to path if not already importable
+        embervlm_root = os.environ.get('EMBERVLM_ROOT')
+        if embervlm_root and embervlm_root not in sys.path:
+            sys.path.insert(0, embervlm_root)
+            eval_logger.info(f"Added EMBERVLM_ROOT to sys.path: {embervlm_root}")
+
+        # Also try common locations if EMBERVLM_ROOT not set
+        if not embervlm_root:
+            embervlm_candidates = [
+                Path(__file__).resolve().parents[4] / "EmberVLM",
+                Path.home() / "EmberVLM",
+                Path("/root/EmberVLM"),
+            ]
+            for candidate in embervlm_candidates:
+                if candidate.exists() and str(candidate) not in sys.path:
+                    sys.path.insert(0, str(candidate))
+                    eval_logger.info(f"Added EmberVLM to sys.path: {candidate}")
+                    break
+
         checkpoint_path = os.environ.get('EMBERVLM_CHECKPOINT', pretrained)
         checkpoint_path = Path(checkpoint_path)
 
