@@ -903,6 +903,20 @@ class EmberVLM(lmms):
                             do_sample=do_sample,
                         )
 
+                        # CRITICAL: Validate generated output tokens
+                        if isinstance(outputs, torch.Tensor):
+                            vocab_size = self._actual_vocab_size
+                            max_output_id = outputs.max().item()
+                            min_output_id = outputs.min().item()
+
+                            if max_output_id >= vocab_size or min_output_id < 0:
+                                eval_logger.warning(
+                                    f"⚠️ Generated tokens out of bounds: "
+                                    f"Range [{min_output_id}, {max_output_id}], Valid [0, {vocab_size-1}]. "
+                                    f"Clamping outputs."
+                                )
+                                outputs = torch.clamp(outputs, 0, vocab_size - 1)
+
                         if isinstance(outputs, torch.Tensor) and self.tokenizer is not None:
                             prompt_len = input_ids.size(1) if input_ids is not None else 0
                             decoded = self.tokenizer.decode(outputs[0][prompt_len:], skip_special_tokens=True)
