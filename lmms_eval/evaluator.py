@@ -504,7 +504,18 @@ def evaluate(
                 cloned_reqs.extend([req] * req.repeats)
 
         # run requests through model
-        resps = getattr(lm, reqtype)(cloned_reqs)  # Choiszt run generate until
+        try:
+            resps = getattr(lm, reqtype)(cloned_reqs)  # Choiszt run generate until
+        except Exception as req_exc:  # noqa: BLE001
+            eval_logger.error(
+                f"Model method '{reqtype}' raised an exception: {req_exc}. "
+                "Falling back to empty responses for this batch. "
+                "Set --verbosity=DEBUG andcheck the adapter for details."
+            )
+            import traceback as _tb
+            eval_logger.debug(_tb.format_exc())
+            # Return safe empty responses so downstream scoring can continue
+            resps = [""] * len(cloned_reqs)
 
         # put responses from model into a list of length K for each request.
         for x, req in zip(resps, cloned_reqs):
